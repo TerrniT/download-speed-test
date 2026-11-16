@@ -195,14 +195,27 @@ class ReportServer:
 
     def serve_forever(self) -> None:
         handler_class = self._make_handler()
-        with socketserver.ThreadingTCPServer(("0.0.0.0", self.port), handler_class) as httpd:
-            httpd.allow_reuse_address = True
-            print(f"Веб-сервер запущен: http://localhost:{self.port}/")
-            print("Нажмите Ctrl+C для остановки.")
-            try:
-                httpd.serve_forever()
-            except KeyboardInterrupt:
-                print("\nСервер остановлен.")
+
+        class ReusableServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+
+        try:
+            httpd = ReusableServer(("0.0.0.0", self.port), handler_class)
+        except OSError as exc:
+            print(f"Не удалось запустить веб-сервер на порту {self.port}: {exc}",
+                  file=sys.stderr)
+            print("Укажите другой порт флагом -p/--port или остановите процесс, "
+                  "занявший порт.", file=sys.stderr)
+            return
+        print(f"Веб-сервер запущен: http://localhost:{self.port}/")
+        print("Нажмите Ctrl+C для остановки.")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nСервер остановлен.")
+        finally:
+            httpd.server_close()
+        return 0
 
     def _make_handler(self):
         content = self.content
@@ -297,8 +310,7 @@ def main() -> int:
 
     content = report_path.read_text(encoding="utf-8")
     server = ReportServer(content, args.port)
-    server.serve_forever()
-    return 0
+    return server.serve_forever()
 
 
 if __name__ == "__main__":
