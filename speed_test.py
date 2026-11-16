@@ -4,9 +4,11 @@
 import argparse
 import html
 import http.server
+import socket
 import socketserver
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,9 +39,10 @@ class ByteFormatter:
 class DownloadSpeedTester:
     """Выполняет серию последовательных запросов и считает скорость скачивания."""
 
-    def __init__(self, url: str, count: int = 10):
+    def __init__(self, url: str, count: int = 10, timeout: float = 30.0):
         self.url = url
         self.count = count
+        self.timeout = timeout
         self.request = urllib.request.Request(
             url, headers={"User-Agent": "download-speed-test/1.0"}
         )
@@ -48,7 +51,7 @@ class DownloadSpeedTester:
     def measure_one(self) -> RequestResult:
         """Выполняет один запрос и возвращает его результат."""
         start = time.perf_counter()
-        with urllib.request.urlopen(self.request) as response:
+        with urllib.request.urlopen(self.request, timeout=self.timeout) as response:
             data = response.read()
         elapsed = time.perf_counter() - start
         return RequestResult(size=len(data), elapsed=elapsed)
@@ -218,6 +221,30 @@ class ReportServer:
         return Handler
 
 
+def describe_error(exc: Exception, url: str, elapsed: float) -> str:
+    """Формирует информативное описание ошибки запроса."""
+    lines = [f"URL: {url}", f"Время до ошибки: {elapsed:.3f} с"]
+    if isinstance(exc, urllib.error.HTTPError):
+        lines.insert(0, f"HTTP-ошибка {exc.code}: {exc.reason}")
+        try:
+            body = exc.read(300)
+            if body:
+                text = body.decode("utf-8", "replace").strip()
+                if text:
+                    lines.append(f"Тело ответа: {text[:300]}")
+        except Exception:  # noqa: BLE001
+            pass
+    elif isinstance(exc, urllib.error.URLError):
+        lines.insert(0, f"Ошибка сети/соединения: {exc.reason}")
+    elif isinstance(exc, socket.timeout):
+        lines.insert(0, "Таймаут соединения (socket.timeout)")
+    elif isinstance(exc, TimeoutError):
+        lines.insert(0, "Таймаут операции")
+    else:
+        lines.insert(0, f"{type(exc).__name__}: {exc}")
+    return "\n".join("  " + line for line in lines)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Делает последовательные запросы к URL, считает скорость скачивания "
@@ -230,6 +257,8 @@ def parse_args() -> argparse.Namespace:
                         help="Путь к HTML-отчёту (по умолчанию report.html)")
     parser.add_argument("-p", "--port", type=int, default=8000,
                         help="Порт веб-сервера (по умолчанию 8000)")
+    parser.add_argument("--timeout", type=float, default=30.0,
+                        help="Таймаут одного запроса в секундах (по умолчанию 30)")
     parser.add_argument("--no-serve", action="store_true",
                         help="Не запускать веб-сервер, только сгенерировать отчёт")
     return parser.parse_args()
@@ -241,17 +270,21 @@ def main() -> int:
         print("Количество запросов должно быть больше 0", file=sys.stderr)
         return 2
 
-    tester = DownloadSpeedTester(args.url, args.count)
+    tester = DownloadSpeedTester(args.url, args.count, args.timeout)
     reporter = ConsoleReporter(tester)
 
     reporter.print_header()
     for i in range(1, args.count + 1):
+        start = time.perf_counter()
         try:
             result = tester.measure_one()
-            tester.results.append(result)
         except Exception as exc:  # noqa: BLE001
-            print(f"[{i}/{args.count}] ОШИБКА: {exc}", file=sys.stderr)
+            elapsed = time.perf_counter() - start
+            print(f"[{i}/{args.count}] ОШИБКА запроса", file=sys.stderr)
+            print(describe_error(exc, args.url, elapsed), file=sys.stderr)
+            print(f"  Успешных запросов до ошибки: {len(tester.results)}", file=sys.stderr)
             return 1
+        tester.results.append(result)
         reporter.print_result(i, result)
 
     reporter.print_summary()
